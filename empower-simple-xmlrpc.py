@@ -21,10 +21,30 @@ import sys
 import getpass
 import base64
 import json
+import threading
 
+from uuid import UUID
 from xmlrpc.server import SimpleXMLRPCServer
 from http.client import HTTPConnection
 from argparse import ArgumentParser
+
+BT_L20 = 0
+BT_HT20 = 1
+BT_HT40 = 2
+
+L20 = 'L20'
+HT20 = 'HT20'
+HT40 = 'HT40'
+
+BANDS = {BT_L20: L20,
+         BT_HT20: HT20,
+         BT_HT40: HT40}
+
+REVERSE_BANDS = {L20: BT_L20,
+                 HT20: BT_HT20,
+                 HT40: BT_HT40}
+
+DEFAULT_PERIOD = 5000
 
 
 def get_connection(args):
@@ -58,13 +78,57 @@ class SimpleApp(SimpleXMLRPCServer):
 
         SimpleXMLRPCServer.__init__(self, ("localhost", 8000))
 
+        self.tenant_id = tenant_id
+        self.every = DEFAULT_PERIOD
+
         self.connection = connection
         self.headers = headers
         self.xmlrpc_url = "http://127.0.0.1:8000/RPC2"
-        self.tenant_id = tenant_id
+        self.worker = None
 
         # register callback
         self.wtp_up(callback=self.wtp_up_callback)
+
+    def run(self):
+        """Start hello messages."""
+
+        self.loop()
+
+        threading.Timer(self.every / 1000, self.run).start()
+
+    def loop(self):
+        """Periodic task."""
+
+        wtps = self.wtps()
+
+        for wtp in wtps:
+            for entry in wtp['supports']:
+                block = {}
+                block['hwaddr'] = entry['hwaddr']
+                block['channel'] = entry['channel']
+                block['band'] = REVERSE_BANDS[entry['band']]
+                block['wtp'] = entry['addr']
+                self.summary(block=block, callback=self.summary_callback)
+
+    def summary_callback(self, tmp):
+
+        print("ciao")
+        print(tmp)
+
+    def summary(self, block, callback):
+        """Summary primitive."""
+
+        url = '/api/v1/tenants/%s/summary' % self.tenant_id
+        data = {"version": "1.0",
+                "block": block,
+                "callback": (self.xmlrpc_url, callback.__name__)}
+
+        response, _ = self.execute(('POST', url), data)
+
+        if response[0] != 201:
+            print("%s %s" % response)
+
+        self.register_function(callback)
 
     def _dispatch(self, method, params):
         try:
@@ -77,23 +141,6 @@ class SimpleApp(SimpleXMLRPCServer):
                 new_args.append(json.loads(arg))
             func(*new_args)
 
-    def __synch_callback(self, url):
-        """Synchonized callback defined on the control with the local ones."""
-
-        cmd = ('GET', url)
-        response, body = self.execute(cmd)
-
-        if response[0] != 200:
-            print("%s %s" % response)
-            sys.exit()
-
-        for entry in body:
-            if 'callback' in entry:
-                callback = entry['callback'][1]
-                if hasattr(globals(), callback):
-                    func = getattr(globals(), callback)
-                    self.register_function(func)
-
     def execute(self, cmd, data=None):
         """ Run command. """
 
@@ -101,20 +148,28 @@ class SimpleApp(SimpleXMLRPCServer):
                                 body=json.dumps(data))
 
         response = self.connection.getresponse()
-        resp = response.readall().decode('utf-8')
+        resp = response.read().decode('utf-8')
 
         if resp:
             return (response.code, response.reason), json.loads(resp)
 
         return (response.code, response.reason), None
 
+    def wtps(self):
+        """List wtps primitive."""
+
+        url = '/api/v1/tenants/%s/wtps' % self.tenant_id
+        response, data = self.execute(('GET', url))
+
+        if response[0] != 200:
+            print("%s %s" % response)
+
+        return data
+
     def wtp_up(self, callback):
         """WTP Up primitive."""
 
         url = '/api/v1/tenants/%s/wtpup' % self.tenant_id
-
-        self.__synch_callback(url)
-
         data = {"version": "1.0",
                 "callback": (self.xmlrpc_url, callback.__name__)}
 
@@ -138,36 +193,33 @@ def main():
 
     parser = ArgumentParser(usage=usage)
 
-    parser.add_argument("-a", "--hostname", dest="host", default="127.0.0.1",
-                        help="EmPOWER REST address; default='127.0.0.1'")
-
+    parser.add_argument("-r", "--host", dest="host", default="127.0.0.1",
+                        help="REST server address; default='127.0.0.1'")
     parser.add_argument("-p", "--port", dest="port", default="8888",
-                        help="EmPOWER REST port; default=8888")
-
+                        help="REST server port; default=8888")
     parser.add_argument("-u", "--user", dest="user", default="root",
                         help="EmPOWER admin user; default='root'")
-
     parser.add_argument("-n", "--no-passwd", action="store_true",
                         dest="no_passwd", default=False,
                         help="Run without password; default false")
-
     parser.add_argument("-f", "--passwd-file", dest="passwdfile",
                         default=None, help="Password file; default=none")
-
-    parser.add_argument("-i", "--tenant-id", dest="tenant_id",
-                        default=None, help="Tenant id; default=none")
-
     parser.add_argument("-t", "--transport", dest="transport", default="http",
                         help="Specify the transport; default='http'")
+    parser.add_argument("-w", "--tenant_id", dest="tenant_id", default=None,
+                        help="Tenant id'")
 
     (args, _) = parser.parse_known_args(sys.argv[1:])
 
-    if not args.tenant_id:
+    tenant_id = UUID(args.tenant_id)
+
+    if not tenant_id:
         raise ValueError("You must specify a valid tenant_id")
 
     connection, headers = get_connection(args)
 
     simple_app = SimpleApp(connection, headers, args.tenant_id)
+    simple_app.run()
 
     # Start xml-rpc server
     simple_app.serve_forever()
